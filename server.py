@@ -213,7 +213,7 @@ class Handler(SimpleHTTPRequestHandler):
             # the media airlock as a browsable tree — live filesystem
             # read: drop a file in media/, reopen the orb, it's there
             EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".webm",
-                    ".glb", ".gltf"}
+                    ".glb", ".gltf", ".stl", ".3mf"}
             media_root = (HERE / "media").resolve()
 
             def walkm(d):

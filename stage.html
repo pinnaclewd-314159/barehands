@@ -637,7 +637,7 @@ const MODEL_PX = 480;
 const MSCENES = new Map();     // tracker: item id -> live three.js bundle
 let _three = null;
 
-function isModelSrc(s) { return /\.(glb|gltf)(\?|$)/i.test(s || ""); }
+function isModelSrc(s) { return /\.(glb|gltf|stl|3mf)(\?|$)/i.test(s || ""); }
 
 function modelModeFor(src, want) {
   // Build 1.4 (Jared's design): the FOLDER is the render law, exactly
@@ -645,6 +645,11 @@ function modelModeFor(src, want) {
   // for 3D sketches/layouts); everything else renders REAL (solid).
   // The command param still overrides for one-off forces.
   if (want === "solid" || want === "holo") return want;
+  // STL carries no color/material data at all (the format is bare
+  // geometry) — Jared's call: STL always reads as the blue hologram
+  // wire by default, no holo/ folder required. 3MF (which DOES carry
+  // real color) keeps the normal folder-decides rule.
+  if (/\.stl(\?|$)/i.test(src || "")) return "holo";
   return /\/holo\//i.test(src || "") ? "holo" : "solid";
 }
 
@@ -817,15 +822,42 @@ function loadThree() {
   if (!_three) _three = Promise.all([
     import("three"),
     import("three/addons/loaders/GLTFLoader.js"),
+    import("three/addons/loaders/STLLoader.js"),
+    import("three/addons/loaders/3MFLoader.js"),
     import("three/addons/environments/RoomEnvironment.js"),
-  ]).then(([T, L, E]) => ({ THREE: T, GLTFLoader: L.GLTFLoader,
+  ]).then(([T, L, S, M, E]) => ({ THREE: T, GLTFLoader: L.GLTFLoader,
+                            STLLoader: S.STLLoader, ThreeMFLoader: M.ThreeMFLoader,
                             RoomEnvironment: E.RoomEnvironment }));
   return _three;
 }
 
+// STL (bare geometry, no material/animation) and 3MF (a real Object3D
+// group, colors included) each need their own loader — GLTFLoader only
+// reads glTF/GLB. This wraps whichever one ran into the same shape
+// buildModelScene already expects ({scene, animations}), so the rest of
+// the pipeline below (framing, explode, holo/solid, animation mixing)
+// doesn't need to know or care which format actually loaded.
+async function loadModel(src, L) {
+  if (/\.stl(\?|$)/i.test(src)) {
+    const geo = await new L.STLLoader().loadAsync(src);
+    if (!geo.attributes.normal) geo.computeVertexNormals();
+    const mesh = new L.THREE.Mesh(geo, new L.THREE.MeshStandardMaterial(
+      { color: 0xaaaaaa, metalness: 0.05, roughness: 0.7 }));
+    const scene = new L.THREE.Group();
+    scene.add(mesh);
+    return { scene, animations: [] };
+  }
+  if (/\.3mf(\?|$)/i.test(src)) {
+    const scene = await new L.ThreeMFLoader().loadAsync(src);
+    return { scene, animations: [] };
+  }
+  return new L.GLTFLoader().loadAsync(src);
+}
+
 async function buildModelScene(el, src, mm, lift) {
   try {
-    const { THREE, GLTFLoader, RoomEnvironment } = await loadThree();
+    const L = await loadThree();
+    const { THREE, RoomEnvironment } = L;
     const canvas = el.querySelector("canvas");
     const renderer = new THREE.WebGLRenderer({ canvas, alpha: true,
                                                antialias: true });
@@ -839,7 +871,7 @@ async function buildModelScene(el, src, mm, lift) {
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 100);
     camera.position.set(0, 0, 3.2);
-    const gltf = await new GLTFLoader().loadAsync(src);
+    const gltf = await loadModel(src, L);
     const obj = gltf.scene;
     let nLift = 0, ghostMat = null;
     // SKELETON-AWARE LOAD (an AI-generated model's export-skeleton
@@ -1732,7 +1764,7 @@ function endGrab(c, i, cur) {
       const bMs = performance.now() - (cur.grabT || 0);
       const bTrav = Math.hypot(cur.x - (c.tapX || cur.x),
                                cur.y - (c.tapY || cur.y));
-      if (bMs < 350 && bTrav < 24) browserTap(c, cur);
+      if (bMs < 420 && bTrav < 34) browserTap(c, cur);
     }
     // v3.3/v3.8: a quick tap on the GRIP BAR closes — notes and
     // folder panes alike
@@ -1741,20 +1773,31 @@ function endGrab(c, i, cur) {
       const gMs = performance.now() - (cur.grabT || 0);
       const gTrav = Math.hypot(cur.x - (c.tapX || cur.x),
                                cur.y - (c.tapY || cur.y));
-      if (gMs < 350 && gTrav < 24) killItem(c);
+      if (gMs < 420 && gTrav < 34) killItem(c);
       c.barGrab = false;
     }
     // GESTURE v3 (2026-08-14, Jared's spec — "make it a single pinch"):
     // THE TAP OPENS — a quick, near-still release on a file-card
     // unfurls its note. Same tap idiom rows and widget buttons already
     // use; the double flash is dead.
+    // 2026-08-27 (Sir's rig): the pinch/claw shape gates were clean —
+    // sampled r 0.09-0.15 held pinch vs 0.59-0.93 held tap-hand, no
+    // overlap — so the shape detector was never the problem. His taps
+    // were grabbing correctly, then silently missing the tap window
+    // and landing as neither a tap nor a drag. These are the only
+    // screen-pixel/wall-clock gates in the file (everything else is
+    // scale-proof hand-geometry ratios), so they're the one place a
+    // bigger board / farther camera distance calls for a nudge instead
+    // of a shape re-sample. Loosened every quick-tap window (all five
+    // instances below) by roughly 30%: 300ms/26px -> 400ms/36px,
+    // 350ms/24px -> 420ms/34px.
     const pullFresh = performance.now() - (c.pullT || 0) < 800 ||
                       cur.probKill;
     if (c.type === "card" && c.def.file && !pullFresh) {
       const tMs = performance.now() - (cur.grabT || 0);
       const tTrav = Math.hypot(cur.x - (c.tapX || cur.x),
                                cur.y - (c.tapY || cur.y));
-      if (tMs < 300 && tTrav < 26) openPanel(c);
+      if (tMs < 400 && tTrav < 36) openPanel(c);
     }
     // GESTURE v3.1 (2026-08-14, the crush is DEAD — "that is happening
     // too naturally"): THE TAP IS SYMMETRIC — tap opens closed things,
@@ -1768,7 +1811,7 @@ function endGrab(c, i, cur) {
       const xMs = performance.now() - (cur.grabT || 0);
       const xTrav = Math.hypot(cur.x - (c.tapX || cur.x),
                                cur.y - (c.tapY || cur.y));
-      if (xMs < 300 && xTrav < 26) killItem(c);
+      if (xMs < 400 && xTrav < 36) killItem(c);
     }
     // PHASE 2 quick-tap releases: the RING toggles its orbital bloom;
     // an ORB grows into its browser pane (same discrimination gate as
@@ -1777,7 +1820,7 @@ function endGrab(c, i, cur) {
       const qMs = performance.now() - (cur.grabT || 0);
       const qTr = Math.hypot(cur.x - (c.tapX ?? cur.x),
                              cur.y - (c.tapY ?? cur.y));
-      if (qMs < 350 && qTr < 24) {
+      if (qMs < 420 && qTr < 34) {
         if (c.type === "widget" && c.def.w === "ring" &&
             c.mode === "move") {
           const sc = RINGS.get(c.id);
