@@ -50,8 +50,13 @@ Your AI drives the ring by writing tiny files into ./state/ :
   state/wave.json  {"samples": [0..1 x 64], "ts": <unix time>}
 Missing files are fine — the ring just idles.
 """
+import errno
 import json
+import os
+import socket
+import sys
 import time
+import urllib.request
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -383,10 +388,47 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class BoardServer(ThreadingHTTPServer):
+    # ONE BOARD PER PORT, ON WINDOWS TOO. http.server turns on SO_REUSEADDR,
+    # and on Windows that lets a second process bind a port another one is
+    # already listening on, so a relaunch silently became a second board
+    # answering the same address. SO_EXCLUSIVEADDRUSE makes that second
+    # bind fail with EADDRINUSE. Elsewhere SO_REUSEADDR only skips
+    # TIME_WAIT, which is what we want.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET,
+                                   socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 if __name__ == "__main__":
     (HERE / "state").mkdir(exist_ok=True)   # the ring's runtime files land here
     port = int(CONFIG.get("port", 8794))
-    print(f"barehands up: http://127.0.0.1:{port}/stage.html", flush=True)
+    url = f"http://127.0.0.1:{port}/stage.html"
+    try:
+        srv = BoardServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        if e.errno not in (errno.EADDRINUSE, errno.EACCES):
+            raise
+        # Already running is a normal outcome, not a crash. Ask whatever
+        # holds the port whether it is a board before saying so.
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                mine = r.status == 200
+        except Exception:
+            mine = False
+        if mine:
+            print(f"barehands already running: {url}", flush=True)
+            sys.exit(0)
+        print(f"port {port} is taken by something that is not barehands.",
+              flush=True)
+        print('Close whatever is using it, or set a different "port" in '
+              "barehands.json.", flush=True)
+        sys.exit(1)
+    print(f"barehands up: {url}", flush=True)
     print("  tracker (camera): open that URL in Chrome", flush=True)
     print("  render (overlay): same URL + ?role=render", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    srv.serve_forever()
